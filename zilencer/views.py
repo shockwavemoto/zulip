@@ -15,8 +15,14 @@ from zerver.lib.response import json_success, json_error, json_response
 from zerver.lib.validator import check_dict
 from zerver.models import get_realm, get_user_profile_by_email, resolve_email_to_domain, \
         UserProfile, Realm
-from .error_notify import notify_server_error, notify_browser_error
-
+from .error_notifyimport notify_server_error, notify_browser_error
+from zerver.decorator import has_request_variables, REQ
+from zerver.lib.actions import internal_send_message
+from zerver.lib.redis_utils import get_redis_client
+from zerver.lib.response import json_success, json_error, json_response
+from zerver.lib.validator import check_dict
+from zerver.models import get_realm, get_user_profile_by_email, resolve_email_to_domain, \
+        UserProfile, Realm
 import time
 
 from six import text_type
@@ -117,6 +123,42 @@ def lookup_endpoints_for_user(request, email=REQ()):
         return json_response(realm_for_email(email).deployment.endpoints)
     except AttributeError:
         return json_error(_("Cannot determine endpoint for user."), status=404)
+
+
+def has_enough_time_expired_since_last_message(sender_email, min_delay):
+    # type: (text_type, float) -> bool
+    # This function returns a boolean, but it also has the side effect
+    # of noting that a new message was received.
+    key = 'zilencer:feedback:%s' % (sender_email,)
+    t = int(time.time())
+    last_time = client.getset(key, t)
+    if last_time is None:
+        return True
+    delay = t - int(last_time)
+    return delay > min_delay
+
+def get_ticket_number():
+    # type: () -> int
+    fn = '/var/tmp/.feedback-bot-ticket-number'
+    try:
+        ticket_number = int(open(fn).read()) + 1
+    except:
+        ticket_number = 1
+    open(fn, 'w').write('%d' % (ticket_number,))
+    return ticket_number
+
+@has_request_variables
+def submit_feedback(request, deployment, message=REQ(validator=check_dict([]))):
+    # type: (HttpRequest, Deployment, Dict[str, text_type]) -> HttpResponse
+    domainish = message["sender_domain"]
+    if get_realm("zulip.com") not in deployment.realms.all():
+        domainish += u" via " + deployment.name
+    subject = "%s" % (message["sender_email"],)
+
+    if len(subject) > 60:
+        subject = subject[:57].rstrip() + "..."
+
+
 
 def account_deployment_dispatch(request, **kwargs):
     # type: (HttpRequest, **Any) -> HttpResponse
