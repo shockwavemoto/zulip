@@ -23,6 +23,21 @@ from confirmation.models import Confirmation
 from zerver.lib.db import reset_queries
 from django.core.mail import EmailMessage
 from zerver.lib.redis_utils import get_redis_client
+from zerver.decorator import has_request_variables, REQ
+from zerver.lib.actions import internal_send_message
+from zerver.lib.redis_utils import get_redis_client
+from zerver.lib.response import json_success, json_error, json_response
+from zerver.lib.validator import check_dict
+from zerver.models import get_realm, get_user_profile_by_email, resolve_email_to_domain, \
+        UserProfile, Realm
+from .error_notifyimport notify_server_error, notify_browser_error
+from zerver.decorator import has_request_variables, REQ
+from zerver.lib.actions import internal_send_message
+from zerver.lib.redis_utils import get_redis_client
+from zerver.lib.response import json_success, json_error, json_response
+from zerver.lib.validator import check_dict
+from zerver.models import get_realm, get_user_profile_by_email, resolve_email_to_domain, \
+        UserProfile, Realm
 
 import os
 import sys
@@ -183,6 +198,80 @@ class UserActivityIntervalWorker(QueueProcessingWorker):
         user_profile = get_user_profile_by_id(event["user_profile_id"])
         log_time = timestamp_to_datetime(event["time"])
         do_update_user_activity_interval(user_profile, log_time)
+
+
+def get_ticket_number():
+    # type: () -> int
+    fn = '/var/tmp/.feedback-bot-ticket-number'
+    try:
+        ticket_number = int(open(fn).read()) + 1
+    except:
+        ticket_number = 1
+    open(fn, 'w').write('%d' % (ticket_number,))
+    return ticket_number
+
+@has_request_variables
+def submit_feedback(request, deployment, message=REQ(validator=check_dict([]))):
+    # type: (HttpRequest, Deployment, Dict[str, text_type]) -> HttpResponse
+    domainish = message["sender_domain"]
+    if get_realm("zulip.com") not in deployment.realms.all():
+        domainish += u" via " + deployment.name
+    subject = "%s" % (message["sender_email"],)
+
+    if len(subject) > 60:
+        subject = subject[:57].rstrip() + "..."
+
+    content = u''
+    sender_email = message['sender_email']
+
+    # We generate ticket numbers if it's been more than a few minutes
+    # since their last message.  This avoids some noise when people use
+    # enter-send.
+    need_ticket = has_enough_time_expired_since_last_message(sender_email, 180)
+
+    if need_ticket:
+        ticket_number = get_ticket_number()
+        content += '\n~~~'
+        content += '\nticket Z%03d (@support please ack)' % (ticket_number,)
+        content += '\nsender: %s' % (message['sender_full_name'],)
+        content += '\nemail: %s' % (sender_email,)
+        if 'sender_domain' in message:
+            content += '\nrealm: %s' % (message['sender_domain'],)
+        content += '\n~~~'
+        content += '\n\n'
+
+    content += message['content']
+
+    internal_send_message("feedback@zulip.com", "stream", "support", subject, content)
+
+    return HttpResponse(message['sender_email'])
+
+@has_request_variables
+def report_error(request, deployment, type=REQ(), report=REQ(validator=check_dict([]))):
+    # type: (HttpRequest, Deployment, text_type, Dict[str, Any]) -> HttpResponse
+    return do_report_error(deployment.name, type, report)
+
+def do_report_error(deployment_name, type, report):
+    # type: (text_type, text_type, Dict[str, Any]) -> HttpResponse
+    report['deployment'] = deployment_name
+    if type == 'browser':
+        notify_browser_error(report)
+    elif type == 'server':
+        notify_server_error(report)
+    else:
+        return json_error(_("Invalid type parameter"))
+    return json_success()
+
+def realm_for_email(email):
+    # type: (str) -> Optional[Realm]
+    try:
+        user = get_user_profile_by_email(email)
+        return user.realm
+    except UserProfile.DoesNotExist:
+        pass
+
+    return get_realm(resolve_email_to_domain(email))
+
 
 @assign_queue('user_presence')
 class UserPresenceWorker(QueueProcessingWorker):
